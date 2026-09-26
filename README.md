@@ -9,4 +9,6 @@ Example: python mc3_extract_models.py atlanta_midnight_clear.pck --props atlanta
 
 Once run, all city models and textures will be extracted.
 
-To import the city into Blender: run the Import_City_Blender script in the Scripting section, making sure to first specify the folder containing the extracted files in the script's OUTPUT_DIR variable. The city will be imported into Blender within a few minutes.
+To import the city into Blender: run the Import_City_Blender.py script in the Scripting section, making sure to first specify the folder containing the extracted files in the script's OUTPUT_DIR variable. The city will be imported into Blender within a few minutes.
+
+Created with Claude AI
