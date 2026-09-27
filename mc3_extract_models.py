@@ -2,7 +2,7 @@
 """
 mc3_extract_models.py -- geometry, texture and lighting extraction for
 Midnight Club 3: DUB Edition (PS2) from .pck files. Output for Blender:
-Import_City_Blender.py places everything. Tested on all four cities
+import_atlanta_city_fast.py places everything. Tested on all four cities
 (Atlanta, Detroit, San Diego, Tokyo). Full format specification: MC3_FORMATS.md.
 
     python3 mc3_extract_models.py <file.pck> [output_folder] [options]
@@ -1271,6 +1271,69 @@ def extract_city_models(data, outdir, pck_path=None, ppf_path=None, channel_orde
         t0 = resolve_tex(fo(tv))
         return tex0_file.get(t0) if t0 is not None else None
 
+    def shader_type(g, shader_idx):
+        """Shader type byte (+4 & 0x7F) of shader shader_idx in sector g, or None."""
+        if g >= n_groups:
+            return None
+        grp = garr + 16 * g
+        if shader_idx > struct.unpack_from('<H', data, grp + 8)[0]:
+            return None
+        sp = struct.unpack_from('<I', data, grp + 4)[0]
+        if not ok(sp, n):
+            return None
+        shv = struct.unpack_from('<I', data, fo(sp) + 4 * shader_idx)[0]
+        if not ok(shv, n):
+            return None
+        return data[fo(shv) + 4] & 0x7F
+
+    def shader_basecolor(g, shader_idx):
+        """basecolor of hdr_object / double_sided_hdr_object shaders (type 2,
+        template 5 or 7): four floats 0..255 at +12..+24; the template modulates
+        the texture by it (white font -> red/green/blue sign lettering). None for
+        other shaders or white."""
+        if g >= n_groups:
+            return None
+        grp = garr + 16 * g
+        if shader_idx > struct.unpack_from('<H', data, grp + 8)[0]:
+            return None
+        sp = struct.unpack_from('<I', data, grp + 4)[0]
+        if not ok(sp, n):
+            return None
+        shv = struct.unpack_from('<I', data, fo(sp) + 4 * shader_idx)[0]
+        if not ok(shv, n):
+            return None
+        S = fo(shv)
+        if (data[S + 4] & 0x7F) != 2 or ((struct.unpack_from('<I', data, S + 4)[0] >> 15) & 0x7F) not in (5, 7):
+            return None
+        rgba = struct.unpack_from('<4f', data, S + 12)
+        if not all(0.0 <= x <= 255.5 for x in rgba):
+            return None
+        rgb = tuple(min(max(x / 255.0, 0.0), 1.0) for x in rgba[:3])
+        if all(x >= 0.995 for x in rgb):
+            return None
+        return rgb
+
+    def window_tint(g, shader_idx):
+        """WindowTint of the window shader (type 16): RGBA floats 0..255 at
+        +16..+28 (city_window.shadert: 'basecolor %2 %3 %4 255' of the second
+        pass -- the interior texture is modulated by it). None for white."""
+        if g >= n_groups:
+            return None
+        grp = garr + 16 * g
+        if shader_idx > struct.unpack_from('<H', data, grp + 8)[0]:
+            return None
+        sp = struct.unpack_from('<I', data, grp + 4)[0]
+        if not ok(sp, n):
+            return None
+        shv = struct.unpack_from('<I', data, fo(sp) + 4 * shader_idx)[0]
+        if not ok(shv, n) or (data[fo(shv) + 4] & 0x7F) != 16:
+            return None
+        rgba = struct.unpack_from('<4f', data, fo(shv) + 16)
+        if not all(0.0 <= x <= 255.5 for x in rgba):
+            return None
+        rgb = tuple(min(max(x / 255.0, 0.0), 1.0) for x in rgba[:3])
+        return None if all(x >= 0.995 for x in rgb) else rgb
+
     def road_detail(g, shader_idx):
         """Road detail texture: (file, U scale, V scale) or None.
 
@@ -1503,9 +1566,10 @@ def extract_city_models(data, outdir, pck_path=None, ppf_path=None, channel_orde
     name_count = {}
     used_tex = set()
     alpha_tex = set()
-    mat_kinds = set()     # (texture file, material suffix)
+    mat_kinds = set()     # (texture file, material suffix[, basecolor tint suffix])
+    tint_of = {}          # '_tRRGGBB' -> (r, g, b) 0..1
     placements, manifest = [], []
-    stats = {'chunks': 0, 'textured': 0, 'dupes_removed': 0, 'window_passes': 0,
+    stats = {'tinted': 0, 'chunks': 0, 'textured': 0, 'dupes_removed': 0, 'window_passes': 0,
              'colored_verts': 0, 'own_lighting_verts': 0,
              'lifted_chunks': 0, 'decals': 0, 'v48_verts': 0,
              'road_detail': 0}
@@ -1516,51 +1580,64 @@ def extract_city_models(data, outdir, pck_path=None, ppf_path=None, channel_orde
         """Overlay levels of chunks within an object: {(k, ci): level}.
 
         Within one object chunks often lie on top of each other in the same
-        plane: asphalt with markings over it, paths on a lawn, stains.
-        The game draws them in order, but in Blender coinciding opaque faces
-        flicker. Chunks are walked in draw order
-        (main, then hdr, alpha). A pair counts as
-        overlapping if points of one chunk lie (+-2 cm) on faces of the other
-        -- in BOTH directions: the shared area may be small relative to one
-        of them. The later chunk gets a level one higher than the earlier."""
+        plane: asphalt with markings over it, paths on a lawn, stains -- and
+        also VERTICAL overlays on walls (San Diego s_inst_dt_blk01_01x: a row
+        of arched windows, main_c4, lies exactly on the window wall main_c2).
+        The main pass has no blending and no alpha test (rmcState: ALPHA
+        0x1000A = Cs, TEST ATST=ALWAYS), so the game simply draws the later
+        chunk over the earlier one at the same depth. In Blender coinciding
+        faces flicker and the overlay is mostly hidden. Chunks are walked in
+        draw order (main, then hdr, alpha). A pair counts as overlapping if
+        face centres of one chunk lie (+-2 cm) on a PARALLEL face of the other
+        -- in any orientation, in BOTH directions. The later chunk gets a
+        level one higher than the earlier."""
         rng = np.random.default_rng(0)
 
         def samples(T):
-            # centres of ALL horizontal faces (up to 300): thin markings
-            # consist of faces smaller than 0.02 m2, a random sample missed them
+            # centres and unit normals of ALL faces (up to 300): thin markings
+            # consist of tiny faces, a random point sample missed them
             n = np.cross(T[:, 1] - T[:, 0], T[:, 2] - T[:, 0])
-            A = 0.5 * np.linalg.norm(n, axis=1)
-            flat = np.flatnonzero((np.abs(n[:, 1]) > 1.8 * A) & (A > 1e-6))
-            if not len(flat):
+            ln = np.linalg.norm(n, axis=1)
+            good = np.flatnonzero(ln > 2e-6)
+            if not len(good):
                 return None
-            if len(flat) > 300:
-                flat = rng.choice(flat, size=300, replace=False)
-            return T[flat].mean(1)
+            if len(good) > 300:
+                good = rng.choice(good, size=300, replace=False)
+            return T[good].mean(1), n[good] / ln[good, None]
 
-        def any_on(P, T2):
-            if P is None:
-                return False
-            a, b, c = T2[:, 0], T2[:, 1], T2[:, 2]
-            v0 = (c - a)[:, [0, 2]]; v1 = (b - a)[:, [0, 2]]
-            d00 = (v0 * v0).sum(1); d01 = (v0 * v1).sum(1); d11 = (v1 * v1).sum(1)
+        def tri_frame(T2):
+            a = T2[:, 0]; e1 = T2[:, 1] - a; e2 = T2[:, 2] - a
+            n = np.cross(e1, e2); ln = np.linalg.norm(n, axis=1)
+            ok_ = ln > 2e-6
+            nh = n / np.where(ok_, ln, 1)[:, None]
+            d00 = (e1 * e1).sum(1); d01 = (e1 * e2).sum(1); d11 = (e2 * e2).sum(1)
             den = d00 * d11 - d01 * d01
-            ok_ = np.abs(den) > 1e-12
-            den = np.where(ok_, den, 1)
-            lo = T2[:, :, [0, 2]].min(1); hi = T2[:, :, [0, 2]].max(1)
-            for pnt in P:
-                near = ok_ & np.all(lo <= pnt[[0, 2]] + 1e-6, 1) & np.all(hi >= pnt[[0, 2]] - 1e-6, 1)
+            ok_ &= np.abs(den) > 1e-14
+            lo = T2.min(1) - 0.03; hi = T2.max(1) + 0.03
+            return a, e1, e2, nh, d00, d01, d11, np.where(ok_, den, 1), ok_, lo, hi
+
+        def any_on(S, F2):
+            if S is None:
+                return False
+            P, Np = S
+            a, e1, e2, nh, d00, d01, d11, den, ok_, lo, hi = F2
+            for pnt, npn in zip(P, Np):
+                near = ok_ & np.all(lo <= pnt, 1) & np.all(hi >= pnt, 1)
                 if not near.any():
                     continue
-                v2 = (pnt - a[near])[:, [0, 2]]
-                d20 = (v2 * v0[near]).sum(1); d21 = (v2 * v1[near]).sum(1)
-                uu = (d11[near] * d20 - d01[near] * d21) / den[near]
-                vv = (d00[near] * d21 - d01[near] * d20) / den[near]
-                ins = (uu >= 0) & (vv >= 0) & (uu + vv <= 1)
-                if ins.any():
-                    an, bn, cn = a[near][ins], b[near][ins], c[near][ins]
-                    yy = an[:, 1] + uu[ins] * (cn[:, 1] - an[:, 1]) + vv[ins] * (bn[:, 1] - an[:, 1])
-                    if np.any(np.abs(yy - pnt[1]) < 0.02):
-                        return True
+                idx = np.flatnonzero(near)
+                w = pnt - a[idx]
+                dist = np.abs((w * nh[idx]).sum(1))
+                par = np.abs((nh[idx] * npn).sum(1)) > 0.95
+                m = (dist < 0.02) & par
+                if not m.any():
+                    continue
+                idx = idx[m]; w = w[m]
+                d20 = (w * e1[idx]).sum(1); d21 = (w * e2[idx]).sum(1)
+                vv = (d11[idx] * d20 - d01[idx] * d21) / den[idx]
+                ww = (d00[idx] * d21 - d01[idx] * d20) / den[idx]
+                if np.any((vv >= -1e-4) & (ww >= -1e-4) & (vv + ww <= 1 + 1e-4)):
+                    return True
             return False
 
         levels, done = {}, []
@@ -1571,11 +1648,12 @@ def extract_city_models(data, outdir, pck_path=None, ppf_path=None, channel_orde
                 lvl = 0
                 if len(f):
                     T = xform(v)[np.array(f)]
-                    P = samples(T)
-                    for T2, P2, l2 in done:
-                        if l2 + 1 > lvl and (any_on(P, T2) or any_on(P2, T)):
+                    S = samples(T)
+                    F = tri_frame(T)
+                    for S2, F2, l2 in done:
+                        if l2 + 1 > lvl and (any_on(S, F2) or any_on(S2, F)):
                             lvl = l2 + 1
-                    done.append((T, P, lvl))
+                    done.append((S, F, lvl))
                 levels[(k, ci)] = lvl
         return levels
 
@@ -1617,7 +1695,13 @@ def extract_city_models(data, outdir, pck_path=None, ppf_path=None, channel_orde
                         if k != 3 and u.shape[1] >= 4 and np.ptp(u[:, 2:4]) > 1e-9 \
                                 and window_pass(g, si):
                             kind = '_mask'
-                        if lvl > 0 and kind == '' and is_decal(tex):
+                        # a lifted overlay gets transparency ONLY with a template shader
+                        # (type 2: doublesided, city_window_cutout... -- their .shadert
+                        # sets an alpha test). Basic shaders (type 0) are drawn in the
+                        # main/ground pass with no blending and ATST=ALWAYS
+                        # (mcInstCityModelClass::SetRenderStates -> rmcState: ALPHA
+                        # 0x1000A = Cs, TEST ATST 1), i.e. the texture alpha is ignored.
+                        if lvl > 0 and kind == '' and shader_type(g, si) == 2 and is_decal(tex):
                             kind = '_decal'
                             stats['decals'] += 1
                         if kind == '_mask':
@@ -1627,16 +1711,35 @@ def extract_city_models(data, outdir, pck_path=None, ppf_path=None, channel_orde
                                 tex = wtex
                             else:
                                 kind = ''          # no windows -- a solid wall
-                        mat_kinds.add((tex, kind))
-                        fh.write(f"usemtl {os.path.splitext(tex)[0]}{kind}\n")
+                        # basecolor of hdr_object templates: a separate material per
+                        # (texture, colour); the tint goes BEFORE the kind suffix so the
+                        # importer's suffix checks (_hdr, _win...) keep working
+                        bc = shader_basecolor(g, si)
+                        tsfx = ''
+                        if bc:
+                            tsfx = '_t%02x%02x%02x' % tuple(int(round(x * 255)) for x in bc)
+                            tint_of[tsfx] = bc
+                        mat_kinds.add((tex, kind, tsfx))
+                        fh.write(f"usemtl {os.path.splitext(tex)[0]}{tsfx}{kind}\n")
                     else:
+                        tsfx = ''
                         fh.write("usemtl no_texture\n")
-                    mat = (os.path.splitext(tex)[0] + kind) if tex else 'no_texture'
+                    mat = (os.path.splitext(tex)[0] + tsfx + kind) if tex else 'no_texture'
                     w = xform(v)
                     if lvl > 0:
-                        # the chunk lies on top of an earlier one -- lift it by its level
+                        # the chunk lies on top of an earlier one -- move it 5 cm per
+                        # level OUTWARDS along its own face normals (up for road
+                        # markings, out of the wall for decals on facades)
                         w = w.copy()
-                        w[:, 1] += 0.05 * lvl
+                        vn = np.zeros_like(w)
+                        if len(f):
+                            fa = np.array(f)
+                            fn = np.cross(w[fa[:, 1]] - w[fa[:, 0]], w[fa[:, 2]] - w[fa[:, 0]])
+                            for j in range(3):
+                                np.add.at(vn, fa[:, j], fn)
+                        ln_ = np.linalg.norm(vn, axis=1)
+                        vn = np.where(ln_[:, None] > 1e-9, vn / np.where(ln_ > 1e-9, ln_, 1)[:, None], 0)
+                        w += vn * (0.05 * lvl)
                         stats['lifted_chunks'] += 1
                     # vertex colour = palette colour (1.0 -- texture unchanged);
                     # without colour -- just 'v x y z'. The scale is verified in the microcode
@@ -1672,14 +1775,19 @@ def extract_city_models(data, outdir, pck_path=None, ppf_path=None, channel_orde
                     else:
                         for p in w:
                             fh.write(f"v {p[0]:.4f} {p[1]:.4f} {p[2]:.4f}\n")
-                    # alpha layer (foliage): V is NOT flipped, as with props.
-                    # Tree atlases: canopy at the top, a bark strip at the bottom; with
-                    # the flip the trunk took the canopy and the branch cards the bark
-                    # ('bark on foliage', a_inst_alpha_tree_04x). The main layer
-                    # is flipped (verified with the GO-GAS sign).
-                    flip_v = (k != 4)
+                    # V is written AS IS for every layer (no 1 - v). The extracted
+                    # PNGs are already upright, and the game's UVs address them the
+                    # same way everywhere. Verified by texture content, not by
+                    # statistics: shop fronts (awning up, doors down) and garage
+                    # doors of a_inst_gasstation_ax, the arched windows of San Diego
+                    # s_inst_dt_blk01_01x (dome up), the sky strips (clouds up,
+                    # horizon haze down), tree atlases (canopy up, bark strip down),
+                    # the 'Water Park' and 'Rx' signs of the hdr layer and the
+                    # 'nitro cola' prop sign. With 1 - v all of these came out
+                    # upside down; an earlier 'GO-GAS' check that suggested
+                    # flipping the main layer was wrong.
                     for q in u:
-                        fh.write(f"vt {q[0]:.4f} {(1 - q[1]) if flip_v else q[1]:.4f}\n")
+                        fh.write(f"vt {q[0]:.4f} {q[1]:.4f}\n")
                     for a, b, c in f:
                         key = face_key(mat, w, a, b, c)
                         if key in seen_faces:
@@ -1709,8 +1817,13 @@ def extract_city_models(data, outdir, pck_path=None, ppf_path=None, channel_orde
                         w2 = w - nrm * 0.05      # 5 cm behind the frames (1 cm flickered at a distance)
                         stats['window_passes'] += 1
                         used_tex.add(wt)
-                        mat_kinds.add((wt, '_win'))
-                        fh.write(f"g {SLOT_NAMES[k]}_c{ci}_win\nusemtl {os.path.splitext(wt)[0]}_win\n")
+                        wtint = window_tint(g, si)
+                        wsfx = ''
+                        if wtint:
+                            wsfx = '_t%02x%02x%02x' % tuple(int(round(x * 255)) for x in wtint)
+                            tint_of[wsfx] = wtint
+                        mat_kinds.add((wt, '_win', wsfx))
+                        fh.write(f"g {SLOT_NAMES[k]}_c{ci}_win\nusemtl {os.path.splitext(wt)[0]}{wsfx}_win\n")
                         if cols is not None:
                             for p, c3 in zip(w2, cols):
                                 fh.write(f"v {p[0]:.4f} {p[1]:.4f} {p[2]:.4f} "
@@ -1719,7 +1832,7 @@ def extract_city_models(data, outdir, pck_path=None, ppf_path=None, channel_orde
                             for p in w2:
                                 fh.write(f"v {p[0]:.4f} {p[1]:.4f} {p[2]:.4f}\n")
                         for q in u:
-                            fh.write(f"vt {q[2]:.4f} {1 - q[3]:.4f}\n")
+                            fh.write(f"vt {q[2]:.4f} {q[3]:.4f}\n")   # second UV pair: as is, like the first
                         for a, b, c in f:
                             fh.write(f"f {a+voff+1}/{a+voff+1} {b+voff+1}/{b+voff+1} "
                                      f"{c+voff+1}/{c+voff+1}\n")
@@ -1869,7 +1982,7 @@ def extract_city_models(data, outdir, pck_path=None, ppf_path=None, channel_orde
                         for p in w:
                             fh.write(f"v {p[0]:.3f} {p[1]:.3f} {p[2]:.3f}\n")
                         for q in u:
-                            fh.write(f"vt {q[0]:.4f} {1 - q[1]:.4f}\n")
+                            fh.write(f"vt {q[0]:.4f} {q[1]:.4f}\n")   # sky: as is (clouds up, horizon down)
                         for a, b, c in f:
                             fh.write(f"f {a+voff+1}/{a+voff+1} {b+voff+1}/{b+voff+1} "
                                      f"{c+voff+1}/{c+voff+1}\n")
@@ -1911,8 +2024,12 @@ def extract_city_models(data, outdir, pck_path=None, ppf_path=None, channel_orde
         f.write("# City materials -- through the engine chain (sector -> shader -> texture)\n")
         f.write("newmtl no_texture\nKd 1 1 1\n")   # no texture (incl. a reference to the texture 'none'): colour from the vertex colours
 
-        for tex, kind in sorted(mat_kinds):
-            f.write(f"\nnewmtl {os.path.splitext(tex)[0]}{kind}\nKd 1 1 1\n"
+        for entry in sorted(mat_kinds):
+            tex, kind = entry[0], entry[1]
+            tsfx = entry[2] if len(entry) > 2 else ''
+            kd = tint_of.get(tsfx, (1.0, 1.0, 1.0))
+            f.write(f"\nnewmtl {os.path.splitext(tex)[0]}{tsfx}{kind}\n"
+                    f"Kd {kd[0]:.3f} {kd[1]:.3f} {kd[2]:.3f}\n"
                     f"map_Kd ../textures/{tex}\n")
             if kind == '_alpha':
                 # alpha slot (foliage, fences): cutout by the texture alpha
@@ -1939,8 +2056,8 @@ def extract_city_models(data, outdir, pck_path=None, ppf_path=None, channel_orde
                 # window shader wall: cutout by the inverted alpha (the glass is transparent)
                 f.write(f"map_d ../textures/{tex}\n")
             elif kind == '_win':
-                # interior behind the glass: self-lit (windows are bright at night in the game)
-                f.write(f"Ke 1 1 1\nmap_Ke ../textures/{tex}\n")
+                # interior behind the glass: self-lit, modulated by WindowTint
+                f.write(f"Ke {kd[0]:.3f} {kd[1]:.3f} {kd[2]:.3f}\nmap_Ke ../textures/{tex}\n")
             elif kind == '_hdr':
                 # hdr slot: night glow panels and spotlight beams -- emission
                 # and transparency (the texture's own alpha, or luminance if it has none)

@@ -1,5 +1,5 @@
 """
-Import_City_Blender.py -- places a Midnight Club 3 (PS2) city and its
+import_city_blender.py -- places a Midnight Club 3 (PS2) city and its
 props in Blender from the output of mc3_extract_models.py.
 
 Works for every city of the game (Atlanta, Detroit, San Diego, Tokyo); the
@@ -10,7 +10,7 @@ USAGE
      (next to the city .pck: its .ppf of the same weather and *_props.pck)
   2. In Blender, Scripting tab: open this file, set OUTPUT_DIR to the output
      folder (e.g. r"C:/Users/.../atlanta_city") and press Run Script.
-     Or: blender --background --python Import_City_Blender.py -- /path
+     Or: blender --background --python import_city_blender.py -- /path
   Best run in a new empty .blend file.
 
 RESULT
@@ -68,6 +68,16 @@ MERGE_CITY = False
 # as in the game: the .obj holds the palette colour, 1.0 = texture unchanged
 # (scale verified in the VU1 microcode). 0.0 -- off.
 CPV_STRENGTH = 1.0
+# Brightness gain of the baked lighting, to approximate the game's final image.
+# The .obj holds the exact per-pass vertex colour (1.0 = texture unchanged,
+# verified in the VU1 microcode), but the game then brightens the whole frame:
+# mcFbGlow downsamples the ENTIRE frame with no threshold (blend set 14, Cs*1),
+# blurs it and ADDS it back (blend set 7, Cs + Cd) -- roughly doubling
+# brightness (its strength is in the external *_hdrparamN files). Blender has no
+# such pass, so with 1.0 walls look much darker than in the game (e.g. the
+# stone around the arches of San Diego s_inst_dt_blk01_01x: ~25/255 instead of
+# ~65/255). 2.0 -- close to the game; 1.0 -- the raw per-pass colour.
+CPV_GAIN = 2.0
 # Collision mesh (physics/ subfolder, extracted with --physics). Not visible
 # geometry: its ~33k triangles follow the ground and roads, and when shown
 # (even as wireframe) it looks like hatching over the whole map.
@@ -157,6 +167,18 @@ def build_materials(obj_dir, tex_dir):
                 tn.interpolation = 'Closest' if PIXELATED_TEXTURES else 'Linear'
                 if bsdf:
                     base_out = tn.outputs['Color']
+                    # texture tint Kd (basecolor of hdr_object templates: white
+                    # font -> red/green/blue sign lettering); white -- no node
+                    kd = cur.get('Kd_rgb')
+                    if kd and tuple(kd) != (1.0, 1.0, 1.0):
+                        try:
+                            tmul = nt.nodes.new('ShaderNodeVectorMath')
+                            tmul.operation = 'MULTIPLY'
+                            tmul.inputs[1].default_value = tuple(kd)
+                            nt.links.new(base_out, tmul.inputs[0])
+                            base_out = tmul.outputs['Vector']
+                        except Exception as ex:
+                            print(f"  tint not applied ({cur['name']}): {ex}")
                     # road detail texture (city_road template, 2nd pass):
                     # black with alpha, tiled by the scale (4 x 4); in the game
                     # normal blending -> colour * (1 - detail alpha)
@@ -194,6 +216,12 @@ def build_materials(obj_dir, tex_dir):
                             nt.links.new(base_out, mul.inputs[0])
                             nt.links.new(at.outputs['Color'], mul.inputs[1])
                             base_out = mul.outputs['Vector']
+                            if CPV_GAIN != 1.0:
+                                gn = nt.nodes.new('ShaderNodeVectorMath')
+                                gn.operation = 'SCALE'
+                                gn.inputs['Scale'].default_value = CPV_GAIN
+                                nt.links.new(base_out, gn.inputs[0])
+                                base_out = gn.outputs['Vector']
                         except Exception:
                             pass
                     nt.links.new(base_out, bsdf.inputs['Base Color'])
@@ -265,7 +293,7 @@ def build_materials(obj_dir, tex_dir):
                 mul = nt.nodes.new('ShaderNodeVectorMath')
                 mul.operation = 'MULTIPLY'
                 nt.links.new(at.outputs['Color'], mul.inputs[0])
-                mul.inputs[1].default_value = (kd[0], kd[1], kd[2])
+                mul.inputs[1].default_value = (kd[0] * CPV_GAIN, kd[1] * CPV_GAIN, kd[2] * CPV_GAIN)
                 nt.links.new(mul.outputs['Vector'], bsdf.inputs['Base Color'])
             except Exception:
                 inp = _input(bsdf, 'Base Color')
